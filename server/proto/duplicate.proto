@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package duplicate;
+
+// Checks whether a property listing looks like a duplicate of an existing
+// one (same address + city + price within ±5% + same contact phone).
+// This mirrors the logic that used to live inline in the monolith's
+// propertyController, now split out as its own service so it can be scaled,
+// deployed, and iterated on independently of the main API.
+service DuplicateDetector {
+  rpc CheckDuplicate (CheckDuplicateRequest) returns (CheckDuplicateResponse);
+}
+
+message CheckDuplicateRequest {
+  string address = 1;
+  string city = 2;
+  double price = 3;
+  string contactPhone = 4;
+  string excludeId = 5; // property id to exclude (used on edits)
+}
+
+message CheckDuplicateResponse {
+  bool isDuplicate = 1;
+  string duplicatePropertyId = 2; // empty string if isDuplicate is false
+}

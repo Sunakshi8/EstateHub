@@ -1,0 +1,17 @@
+{
+  "name": "notification-consumer-service",
+  "version": "1.0.0",
+  "description": "Standalone Kafka consumer that reacts to EstateHub inquiry events",
+  "main": "consumer.js",
+  "scripts": {
+    "start": "node consumer.js",
+    "dev": "nodemon consumer.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "kafkajs": "^2.2.4"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  }
+}
