@@ -12,7 +12,7 @@ Centralized property discovery with trust-first features — verified listings, 
 [![JWT](https://img.shields.io/badge/Auth-JWT-000000?logo=jsonwebtokens&logoColor=white)](https://jwt.io/)
 [![Tailwind](https://img.shields.io/badge/Styling-TailwindCSS-06B6D4?logo=tailwindcss&logoColor=white)](https://tailwindcss.com/)
 
-[Live Demo](#)  https://estate-hub-zeta-sepia.vercel.app/
+[Live Demo](#) -> https://estate-hub-zeta-sepia.vercel.app/
 · [Report Bug](../../issues) · [Request Feature](../../issues)
 
 </div>
