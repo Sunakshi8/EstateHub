@@ -1,6 +1,7 @@
-version: "3.9"
+name: estatehub
 
 services:
+  # ------------------------------------------------------------------ data stores
   mongo:
     image: mongo:7
     container_name: estatehub-mongo
@@ -9,41 +10,93 @@ services:
       - "27017:27017"
     volumes:
       - mongo_data:/data/db
-    networks:
-      - estatehub-net
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [estatehub-net]
 
-  # Single-node Kafka in KRaft mode (no separate Zookeeper needed).
+  postgres:
+    image: postgres:16-alpine
+    container_name: estatehub-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: estatehub
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-estatehub}
+      POSTGRES_DB: estatehub
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U estatehub -d estatehub"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    networks: [estatehub-net]
+
+  # Single-node Kafka in KRaft mode (no Zookeeper). Two listeners:
+  #   kafka:29092      -> other containers
+  #   localhost:9092   -> tools / services running on your host machine
   kafka:
-    image: bitnami/kafka:3.7
+    image: apache/kafka:3.8.0
     container_name: estatehub-kafka
     restart: unless-stopped
     ports:
       - "9092:9092"
     environment:
-      KAFKA_CFG_NODE_ID: "0"
-      KAFKA_CFG_PROCESS_ROLES: controller,broker
-      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
-      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
-      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 0@kafka:9093
-      ALLOW_PLAINTEXT_LISTENER: "yes"
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://:29092,EXTERNAL://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false" # topics are provisioned explicitly by the services
     volumes:
-      - kafka_data:/bitnami/kafka
-    networks:
-      - estatehub-net
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:29092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 20s
+    networks: [estatehub-net]
 
+  # Optional topic browser / DLQ inspector:  docker compose --profile tools up -d kafka-ui
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: estatehub-kafka-ui
+    profiles: ["tools"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: estatehub
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    networks: [estatehub-net]
+
+  # ------------------------------------------------------------------ microservices
   duplicate-detector:
     build:
       context: ./services/duplicate-detector
     container_name: estatehub-duplicate-detector
     restart: unless-stopped
     depends_on:
-      - mongo
+      mongo:
+        condition: service_healthy
     environment:
       GRPC_PORT: 50051
       MONGO_URI: mongodb://mongo:27017/estatehub
-    networks:
-      - estatehub-net
+    networks: [estatehub-net]
 
   notification-consumer:
     build:
@@ -51,35 +104,75 @@ services:
     container_name: estatehub-notification-consumer
     restart: unless-stopped
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
     environment:
-      KAFKA_BROKER: kafka:9092
-    networks:
-      - estatehub-net
+      KAFKA_BROKERS: kafka:29092
+      CONSUMER_GROUP: notification-service
+    networks: [estatehub-net]
 
+  # Kafka -> Recommendation Service -> PostgreSQL -> preference score
+  recommendation-service:
+    build:
+      context: ./services/recommendation-service
+    container_name: estatehub-recommendation-service
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://estatehub:${POSTGRES_PASSWORD:-estatehub}@postgres:5432/estatehub
+      KAFKA_BROKERS: kafka:29092
+      CONSUMER_GROUP: recommendation-service
+      HTTP_PORT: 5100
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-dev-internal-token}
+      HALF_LIFE_DAYS: 14
+    ports:
+      - "5100:5100"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5100/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks: [estatehub-net]
+
+  # ------------------------------------------------------------------ main API + client
   server:
     build:
       context: ./server
     container_name: estatehub-server
     restart: unless-stopped
     depends_on:
-      - mongo
-      - kafka
-      - duplicate-detector
+      mongo:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      duplicate-detector:
+        condition: service_started
+      recommendation-service:
+        condition: service_started
     ports:
       - "5000:5000"
     environment:
+      NODE_ENV: production
       PORT: 5000
       MONGO_URI: mongodb://mongo:27017/estatehub
+      DATABASE_URL: postgres://estatehub:${POSTGRES_PASSWORD:-estatehub}@postgres:5432/estatehub
       JWT_SECRET: ${JWT_SECRET:-change_this_secret_in_production}
       JWT_EXPIRES_IN: 7d
       CLIENT_URL: http://localhost:5173
-      KAFKA_BROKER: kafka:9092
+      KAFKA_BROKERS: kafka:29092
       DUPLICATE_SERVICE_URL: duplicate-detector:50051
+      RECOMMENDATION_SERVICE_URL: http://recommendation-service:5100
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-dev-internal-token}
     volumes:
       - uploads_data:/app/uploads
-    networks:
-      - estatehub-net
+    networks: [estatehub-net]
 
   client:
     build:
@@ -90,13 +183,13 @@ services:
       - server
     ports:
       - "5173:80"
-    networks:
-      - estatehub-net
+    networks: [estatehub-net]
 
 volumes:
   mongo_data:
-  uploads_data:
+  pg_data:
   kafka_data:
+  uploads_data:
 
 networks:
   estatehub-net:

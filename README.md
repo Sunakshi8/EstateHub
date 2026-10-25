@@ -2,7 +2,7 @@
 
 # 🏠 EstateHub
 
-### A Full-Stack MERN Real Estate Marketplace
+### A Full-Stack Real Estate Marketplace — TypeScript · MongoDB · PostgreSQL · Kafka
 
 Centralized property discovery with trust-first features — verified listings, spam-proof inquiries, and resident-backed reviews.
 
@@ -12,8 +12,7 @@ Centralized property discovery with trust-first features — verified listings, 
 [![JWT](https://img.shields.io/badge/Auth-JWT-000000?logo=jsonwebtokens&logoColor=white)](https://jwt.io/)
 [![Tailwind](https://img.shields.io/badge/Styling-TailwindCSS-06B6D4?logo=tailwindcss&logoColor=white)](https://tailwindcss.com/)
 
-[Live Demo](#) -> https://estate-hub-zeta-sepia.vercel.app/
-· [Report Bug](../../issues) · [Request Feature](../../issues)
+[Live Demo](#) · [Report Bug](../../issues) · [Request Feature](../../issues)
 
 </div>
 
@@ -75,12 +74,12 @@ Every core feature maps to a specific real-world complaint:
 |---|---|
 | Frontend | React 18, Vite, Redux Toolkit, React Router, Tailwind CSS |
 | Maps | Leaflet.js, OpenStreetMap, Nominatim Geocoding API |
-| Backend | Node.js, Express.js |
+| Backend | Node.js, Express.js, **TypeScript (strict)** |
 | APIs | REST (primary) + GraphQL read-layer (Apollo Server 5) |
-| Database | MongoDB, Mongoose |
+| Databases | MongoDB + Mongoose (primary store), **PostgreSQL** (outbox + preference scores) |
 | Auth | JSON Web Tokens (JWT), bcrypt |
 | File Uploads | Multer |
-| Microservices | gRPC (Protocol Buffers) for inter-service calls, Apache Kafka for event streaming |
+| Microservices | gRPC (Protocol Buffers) for inter-service calls, Apache Kafka for event streaming (typed contracts, DLQ, outbox) |
 | Containerization | Docker, Docker Compose |
 | Tooling | ESLint, dotenv, Git |
 
@@ -88,145 +87,130 @@ Every core feature maps to a specific real-world complaint:
 
 ## 🏗️ Architecture
 
-EstateHub runs as six containers under Docker Compose: the React frontend, the main Express API, MongoDB, a Kafka broker, and two standalone microservices that the main API talks to over the network rather than calling in-process.
-
 ```
-                    ┌─────────────┐
-                    │   client    │  React (nginx)
-                    └──────┬──────┘
-                           │ REST + GraphQL
-                    ┌──────▼──────┐        gRPC         ┌───────────────────────┐
-                    │   server    │ ──────────────────▶ │ duplicate-detector     │
-                    │ (Express)   │                      │ (gRPC microservice)    │
-                    └──────┬──────┘                      └───────────┬───────────┘
-                           │ publishes                               │ reads
-                           │ "inquiry.created"                       ▼
-                    ┌──────▼──────┐                            ┌──────────┐
-                    │    kafka    │                            │  mongo   │
-                    └──────┬──────┘                            └──────────┘
-                           │ consumes
-                    ┌──────▼──────────────┐
-                    │ notification-        │
-                    │ consumer (Kafka)     │
-                    └───────────────────────┘
+ client (React/nginx)
+      │ REST + GraphQL
+      ▼
+ server (Express, TypeScript) ──gRPC──▶ duplicate-detector ──▶ MongoDB
+      │  │
+      │  └──HTTP (x-internal-token)──▶ recommendation-service ◀─────────────┐
+      │                                   │  ▲                              │
+      │ publishes typed events            │  │ consumes                     │
+      ▼                                   ▼  │                              │
+   Kafka  ── estatehub.inquiries ─────────────┘                              │
+   topics ── estatehub.interactions ──▶ notification-consumer                │
+          ── estatehub.properties (compacted)                                │
+          ── *.dlq (dead letters)                                            │
+                                                                             │
+ server ──(broker down?)──▶ PostgreSQL outbox_events ──relay──▶ Kafka        │
+                                                                             │
+ recommendation-service ──▶ PostgreSQL  reco.user_preferences  ─────────────┘
+                                         (preference scores)
 ```
 
-**Why split these two out as separate services instead of just functions in the monolith?** Both demonstrate patterns used in real distributed backends — gRPC for low-latency synchronous inter-service calls, Kafka for decoupled asynchronous event handling — without needing to rewrite the whole app as microservices. Both also degrade gracefully: if `duplicate-detector` or `kafka` aren't running, the main app logs a warning and falls back to local behavior rather than failing the request (see `server/grpcClients/duplicateDetectorClient.js` and `server/events/kafkaProducer.js`).
+MongoDB stays the **source of truth** for users, properties, inquiries and reviews. PostgreSQL is added for the two jobs it is better at: a transactional **outbox** (server) and the **preference-score store** (recommendation-service).
+
+### Recommendation pipeline
+
+```
+Kafka → Recommendation Service → PostgreSQL → Preference score
+```
+
+1. The API emits events: `property.viewed`, `property.favorited/unfavorited`, `inquiry.created/reopened`, `search.performed`, and `property.upserted/removed` snapshots.
+2. `recommendation-service` consumes them. Each event is applied in **one PostgreSQL transaction** that begins with an idempotency check, so redeliveries are harmless.
+3. Each interaction updates `reco.user_preferences` — one row per `(user, feature)` for city, locality, property type, price band, bedrooms, furnishing and amenities:
+
+   `score = old_score × 0.5^(elapsed / half-life) + interaction_weight`
+
+   Weights: view 1 · favorite 4 · un-favorite −3 · inquiry 8 · site-visit inquiry 10 · search 0.5. Half-life is 14 days (`HALF_LIFE_DAYS`), so recent behaviour dominates.
+4. At request time candidates are scored: **85 % preference match** (weighted, normalised per feature type, neighbouring price bands earn partial credit) + **15 % popularity**. Each result carries a 0–100 score and human-readable reasons ("You've been looking at Shimla"). Users with no history get popular listings (cold start).
+5. `GET /api/recommendations` (server) hydrates the ranked ids from MongoDB. If the service is down it falls back to the latest listings.
+
+Tunables live in `services/recommendation-service/src/scoring/weights.ts`.
+
+### Kafka, made serious
+
+| Concern | What changed |
+|---|---|
+| Contracts | Every message is a versioned envelope (`eventId`, `type`, `version`, `occurredAt`, `producer`, `correlationId`) validated with **zod** on both producer and consumer (`shared/schemas.ts`) |
+| Topics | Provisioned explicitly (partitions, retention, `min.insync.replicas`); `estatehub.properties` is **log-compacted** so a new consumer can rebuild its read model; auto-create is disabled on the broker |
+| Ordering | Deterministic partition keys: buyer/user id for inquiries & interactions, property id for property state |
+| Producer | Idempotent, `acks=all`, headers for tracing, circuit breaker so a dead broker doesn't add latency to requests |
+| Durability | **Transactional outbox** in PostgreSQL: if Kafka is unreachable the event is parked and a relay (`FOR UPDATE SKIP LOCKED`, ordered) delivers it later — events survive broker outages and restarts |
+| Consumers | `ResilientConsumer`: at-least-once, exponential-backoff retries, **dead-letter topics** with diagnostic headers, poison messages never block a partition, unknown event types skipped (forward-compatible), never drops a message if the DLQ write fails |
+| Idempotency | `reco.processed_events` ledger written in the same transaction as the state change |
+| Tracing | `x-request-id` → `correlationId` on every event |
+| Ops | `/api/health` exposes producer, outbox depth and Postgres status; optional Kafka UI (`--profile tools`) |
+
+`shared/` is the single source of truth for topics/schemas/consumer runner; `npm run sync:shared` copies it into each independently deployable service and CI runs `check:shared` to catch drift.
 
 ```
 estatehub/
-├── client/                      # React + Vite frontend
-│   └── src/
-│       ├── api/                 # Axios instance with auth interceptor
-│       ├── components/          # Navbar, PropertyCard, MapView, StarRating...
-│       ├── pages/                # Home, PropertyDetail, dashboards, auth
-│       └── store/                # Redux Toolkit auth slice
-│
-├── server/                      # Express + MongoDB backend (main API)
-│   ├── controllers/             # Business logic (auth, property, inquiry, review, admin)
-│   ├── models/                  # Mongoose schemas
-│   ├── routes/                  # REST API endpoints
-│   ├── graphql/                 # Apollo Server typeDefs + resolvers
-│   ├── grpcClients/             # gRPC client for duplicate-detector, with fallback
-│   ├── events/                  # Kafka producer + topic names
-│   ├── middleware/              # JWT auth guard, role authorization, image upload
-│   └── utils/                   # Shared filter builder, duplicate-check fallback, tokens
-│
+├── client/                         # React + Vite (new: "Recommended for you" tab)
+├── server/                         # Express API — TypeScript
+│   ├── src/{config,models,middleware,controllers,routes,graphql,grpcClients,events,services,utils}
+│   ├── db/migrations/              # PostgreSQL (outbox)
+│   └── proto/
 ├── services/
-│   ├── duplicate-detector/      # Standalone gRPC microservice (Protocol Buffers)
-│   └── notification-consumer/   # Standalone Kafka consumer
-│
-├── docker-compose.yml           # Wires all 6 containers together
-└── README.md
+│   ├── recommendation-service/     # NEW — Kafka consumer + PostgreSQL + HTTP API
+│   ├── notification-consumer/      # Kafka consumer (now with retries + DLQ)
+│   └── duplicate-detector/         # gRPC microservice — TypeScript
+├── shared/                         # Kafka contracts (source of truth)
+├── scripts/sync-shared.sh
+├── .github/workflows/ci.yml
+└── docker-compose.yml              # mongo, postgres, kafka, 3 services, server, client
 ```
 
 ---
 
 ## 🚀 Getting Started
 
-There are two ways to run EstateHub — with Docker (fastest, everything included) or manually with Node.js.
-
 ### Option A — Docker (recommended)
-
-**Prerequisites:** [Docker](https://www.docker.com/) + Docker Compose installed.
 
 ```bash
 git clone https://github.com/Sunakshi8/EstateHub.git
 cd EstateHub
 docker compose up --build
+docker compose exec server node dist/seed.js      # demo accounts + publishes property snapshots
 ```
-
-This spins up six containers on one bridge network — MongoDB, Kafka, the `duplicate-detector` gRPC service, the `notification-consumer` Kafka consumer, the Express API, and the React app (built and served via nginx) — with sensible defaults baked into `docker-compose.yml` for local use. Override `JWT_SECRET` as an environment variable for anything beyond local testing.
 
 - Frontend → http://localhost:5173
-- Backend API → http://localhost:5000
-- GraphQL endpoint → http://localhost:5000/graphql
-- Kafka broker → localhost:9092 (internal; the API and consumer reach it via the `kafka` service name)
-- gRPC duplicate-detector → localhost:50051 (internal only, not published to the host)
+- API → http://localhost:5000 (health: `/api/health`) · GraphQL → `/graphql`
+- Recommendation service → http://localhost:5100/health
+- PostgreSQL → localhost:5432 (`estatehub` / `estatehub`)
+- Kafka (host access) → localhost:9092 · Kafka UI: `docker compose --profile tools up -d kafka-ui` → http://localhost:8080
 
-To seed demo accounts into the Dockerized database:
+Watch it learn:
 ```bash
-docker compose exec server node seed.js
+docker compose logs -f recommendation-service notification-consumer
+# log in as buyer@estatehub.com, view/favorite listings, open Dashboard → "Recommended for you"
+docker compose exec postgres psql -U estatehub -c \
+  "SELECT feature_type, feature_value, round(score::numeric,2) FROM reco.user_preferences ORDER BY score DESC LIMIT 10;"
 ```
 
-To watch the Kafka event flow live, send an inquiry through the app, then:
-```bash
-docker compose logs -f notification-consumer
-```
+### Option B — Manual
 
-### Option B — Manual (Node.js)
-
-**Prerequisites:**
-- Node.js 18+
-- A MongoDB database — [MongoDB Atlas](https://www.mongodb.com/cloud/atlas) (free tier) or local MongoDB
-
-**Installation**
+Prerequisites: Node 20+, MongoDB, PostgreSQL 16, Kafka (the compose file can run just the infra: `docker compose up mongo postgres kafka`).
 
 ```bash
-git clone https://github.com/Sunakshi8/EstateHub.git
-cd EstateHub
 npm run install:all
-```
-
-**Configuration**
-
-```bash
-cd server
-cp .env.example .env
-```
-
-Fill in `server/.env`:
-```env
-PORT=5000
-MONGO_URI=your_mongodb_connection_string
-JWT_SECRET=your_random_secret_key
-JWT_EXPIRES_IN=7d
-CLIENT_URL=http://localhost:5173
-```
-
-The `DUPLICATE_SERVICE_URL` and `KAFKA_BROKER` lines in `.env.example` are optional — the app runs fine without `services/duplicate-detector` or a Kafka broker up; it just falls back to in-process behavior and skips publishing events (see the "gRPC" and "Kafka" sections below). Run them yourself per-service if you want the full microservices demo without Docker — see each service's own `npm start` instructions further down — or just use Option A (Docker) to get everything at once.
-
-**Seed demo data (optional)**
-
-```bash
+cp server/.env.example server/.env                       # set JWT_SECRET
+cp services/recommendation-service/.env.example services/recommendation-service/.env
+cp services/notification-consumer/.env.example services/notification-consumer/.env
 npm run seed
-```
-
-| Role | Email | Password |
-|---|---|---|
-| Admin | admin@estatehub.com | admin123 |
-| Agent | agent@estatehub.com | agent123 |
-| Buyer | buyer@estatehub.com | buyer123 |
-
-**Run**
-
-```bash
 npm run dev
 ```
 
-- Frontend → http://localhost:5173
-- Backend API → http://localhost:5000
-- GraphQL endpoint → http://localhost:5000/graphql
+Everything degrades gracefully: without PostgreSQL the API still serves (no outbox / recommendations); without Kafka events queue in the outbox; without the recommendation service the endpoint falls back to latest listings.
+
+### Scripts
+
+```bash
+npm run typecheck     # tsc --noEmit in all four TypeScript projects
+npm run build         # compile all
+npm test              # unit tests (+ PostgreSQL integration tests if TEST_DATABASE_URL is set)
+npm run backfill:events --prefix server   # re-publish property snapshots to rebuild the reco read model
+```
 
 ---
 
@@ -242,10 +226,12 @@ npm run dev
 | POST | `/api/inquiries` | Send an inquiry | Authenticated |
 | PUT | `/api/inquiries/:id/respond` | Reply to inquiry thread | Authenticated |
 | POST | `/api/reviews` | Submit a review | Authenticated |
+| GET | `/api/recommendations` | Personalised, scored recommendations | Authenticated |
+| GET | `/api/recommendations/preferences` | Your learned preference scores | Authenticated |
 | GET | `/api/admin/properties/pending` | View moderation queue | Admin |
 | PUT | `/api/admin/properties/:id/moderate` | Approve/reject listing | Admin |
 
-Full route definitions live in `server/routes/`.
+Full route definitions live in `server/src/routes/`.
 
 ### GraphQL (read-only search layer)
 
@@ -266,11 +252,11 @@ query {
 }
 ```
 
-The REST controller and the GraphQL resolver both call the same `buildPropertyQuery()` helper (`server/utils/buildPropertyQuery.js`), so filtering logic can't drift between the two APIs.
+The REST controller and the GraphQL resolver both call the same `buildPropertyQuery()` helper (`server/src/utils/buildPropertyQuery.ts`), so filtering logic can't drift between the two APIs.
 
 ### gRPC — duplicate-listing detection as a separate service
 
-`services/duplicate-detector` is a standalone Node process exposing one RPC, `CheckDuplicate`, defined in `services/duplicate-detector/proto/duplicate.proto`. When a new property is created, the main API calls this service over gRPC (`server/grpcClients/duplicateDetectorClient.js`) with a 2-second deadline instead of running the check in-process. If the service doesn't respond in time — including when it's simply not running — the API logs a warning and falls back to the original in-process implementation (`server/utils/duplicateCheck.js`) so listing creation never breaks because of it.
+`services/duplicate-detector` is a standalone Node process exposing one RPC, `CheckDuplicate`, defined in `services/duplicate-detector/proto/duplicate.proto`. When a new property is created, the main API calls this service over gRPC (`server/src/grpcClients/duplicateDetectorClient.ts`) with a 2-second deadline instead of running the check in-process. If the service doesn't respond in time — including when it's simply not running — the API logs a warning and falls back to the original in-process implementation (`server/src/utils/duplicateCheck.ts`) so listing creation never breaks because of it.
 
 ```bash
 # Run it standalone against a local MongoDB, outside Docker:
@@ -281,20 +267,9 @@ npm start
 # → duplicate-detector: gRPC service listening on port 50051
 ```
 
-### Kafka — event-driven inquiry notifications
+### Kafka consumers
 
-When a buyer sends (or re-opens) an inquiry, the API publishes an `inquiry.created` / `inquiry.reopened` event to the `estatehub.inquiries` topic (`server/events/kafkaProducer.js`) — fire-and-forget, never blocking or failing the HTTP response. `services/notification-consumer` is a separate process that subscribes to that topic and logs what a real notification service would do with the event (send an email, push a mobile alert, etc.) — demonstrating the producer → broker → consumer wiring without standing up a real email provider for a portfolio project.
-
-```bash
-# Watch events arrive, outside Docker (requires a local Kafka broker on :9092):
-cd services/notification-consumer
-cp .env.example .env
-npm install
-npm start
-# → notification-consumer: subscribed to "estatehub.inquiries"
-```
-
-Both the publisher and consumer skip silently (with a logged warning) if no broker is reachable — the core app works with zero Kafka setup; running it just adds the live event-streaming demo on top.
+`services/notification-consumer` subscribes to `estatehub.inquiries` and logs what a real notification service would do (email/push), de-duplicating redelivered events. `services/recommendation-service` subscribes to all three topics. Both use the shared `ResilientConsumer` (retries → DLQ). To inspect dead letters: `docker compose --profile tools up -d kafka-ui` and open the `*.dlq` topics — headers show the reason, error, attempts and source offset.
 
 ---
 
@@ -306,8 +281,12 @@ Both the publisher and consumer skip silently (with a logged warning) if no brok
 - [ ] Price history chart on listing page
 - [ ] Booking-token payments (Razorpay/Stripe)
 - [ ] AI-assisted price prediction
-- [ ] Transactional outbox pattern for the Kafka producer (currently fire-and-forget; an outbox table would guarantee the event is eventually published even if the process crashes right after the DB write)
-- [ ] TypeScript on the server (currently JS with JSDoc-style clarity; schemas and controllers are structured to make this a mechanical conversion later)
+- [x] Outbox fallback for Kafka publishing (PostgreSQL)
+- [ ] Full transactional outbox (write the event atomically with the Mongo change — needs Mongo transactions / change streams)
+- [x] TypeScript on the server and all services
+- [ ] TypeScript on the client
+- [ ] Collaborative filtering ("buyers like you") on top of preference scores
+- [ ] Kafka authentication/TLS + multi-broker replication for production
 
 ---
 

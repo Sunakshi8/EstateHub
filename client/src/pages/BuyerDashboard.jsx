@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import api from "../api/axios";
 import PropertyCard from "../components/PropertyCard";
+import RecommendedProperties from "../components/RecommendedProperties";
 
 function formatPrice(price) {
   if (price >= 10000000) return `₹${(price / 10000000).toFixed(2)} Cr`;
@@ -69,9 +70,19 @@ export default function BuyerDashboard() {
         >
           My Inquiries ({inquiries.length})
         </button>
+        <button
+          onClick={() => setTab("recommended")}
+          className={`px-4 py-2 text-sm font-medium ${
+            tab === "recommended" ? "border-b-2 border-brand-500 text-brand-500" : "text-gray-500"
+          }`}
+        >
+          Recommended for you
+        </button>
       </div>
 
-      {loading ? (
+      {tab === "recommended" && <RecommendedProperties />}
+
+      {tab === "recommended" ? null : loading ? (
         <p className="text-gray-400">Loading...</p>
       ) : tab === "favorites" ? (
         favorites.length === 0 ? (

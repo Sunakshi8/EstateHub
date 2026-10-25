@@ -1,17 +1,27 @@
 {
   "name": "notification-consumer-service",
-  "version": "1.0.0",
-  "description": "Standalone Kafka consumer that reacts to EstateHub inquiry events",
-  "main": "consumer.js",
+  "version": "2.0.0",
+  "description": "Kafka consumer that reacts to EstateHub inquiry events (TypeScript, DLQ + retries)",
+  "main": "dist/index.js",
+  "type": "commonjs",
+  "engines": { "node": ">=20" },
   "scripts": {
-    "start": "node consumer.js",
-    "dev": "nodemon consumer.js"
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "test": "vitest run"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
-    "kafkajs": "^2.2.4"
+    "kafkajs": "^2.2.4",
+    "pino": "^9.3.2",
+    "zod": "^3.23.8"
   },
   "devDependencies": {
-    "nodemon": "^3.1.4"
+    "@types/node": "^20.14.12",
+    "tsx": "^4.16.5",
+    "typescript": "^5.5.4",
+    "vitest": "^2.0.5"
   }
 }

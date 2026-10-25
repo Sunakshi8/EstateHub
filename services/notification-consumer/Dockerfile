@@ -1,11 +1,17 @@
-# --- Notification-Consumer (Kafka consumer microservice) ---
-FROM node:20-alpine
-
+# --- Notification-Consumer (TypeScript Kafka consumer microservice) ---
+FROM node:20-alpine AS build
 WORKDIR /app
-
 COPY package*.json ./
-RUN npm install --omit=dev
+RUN npm ci
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build
 
-COPY . .
+FROM node:20-alpine
+ENV NODE_ENV=production
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev
+COPY --from=build /app/dist ./dist
 
-CMD ["node", "consumer.js"]
+CMD ["node", "dist/index.js"]
