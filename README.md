@@ -74,7 +74,7 @@ Every core feature maps to a specific real-world complaint:
 |---|---|
 | Frontend | React 18, Vite, Redux Toolkit, React Router, Tailwind CSS |
 | Maps | Leaflet.js, OpenStreetMap, Nominatim Geocoding API |
-| Backend | Node.js, Express.js, **TypeScript (strict)** |
+| Backend | Node.js, Express.js, **TypeScript ** |
 | APIs | REST (primary) + GraphQL read-layer (Apollo Server 5) |
 | Databases | MongoDB + Mongoose (primary store), **PostgreSQL** (outbox + preference scores) |
 | Auth | JSON Web Tokens (JWT), bcrypt |
