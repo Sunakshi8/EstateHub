@@ -1,4 +1,4 @@
-<div align="center">
+
 
 # 🏠 EstateHub
 
@@ -7,10 +7,15 @@
 Centralized property discovery with trust-first features — verified listings, spam-proof inquiries, and resident-backed reviews.
 
 [![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=white)](https://react.dev/)
-[![Node.js](https://img.shields.io/badge/Node.js-Express-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
+[![Node.js](https://img.shields.io/badge/Node.js-20+-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![MongoDB](https://img.shields.io/badge/MongoDB-Atlas-47A248?logo=mongodb&logoColor=white)](https://www.mongodb.com/atlas)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
+[![Kafka](https://img.shields.io/badge/Apache-Kafka-231F20?logo=apachekafka&logoColor=white)](https://kafka.apache.org/)
+[![gRPC](https://img.shields.io/badge/gRPC-Protobuf-244C5A?logo=grpc&logoColor=white)](https://grpc.io/)
 [![JWT](https://img.shields.io/badge/Auth-JWT-000000?logo=jsonwebtokens&logoColor=white)](https://jwt.io/)
 [![Tailwind](https://img.shields.io/badge/Styling-TailwindCSS-06B6D4?logo=tailwindcss&logoColor=white)](https://tailwindcss.com/)
+[![CI](https://github.com/Sunakshi8/EstateHub/actions/workflows/ci.yml/badge.svg)](https://github.com/Sunakshi8/EstateHub/actions)
 
 [Live Demo](#) · [Report Bug](../../issues) · [Request Feature](../../issues)
 
@@ -61,6 +66,10 @@ Every core feature maps to a specific real-world complaint:
 - Auto-verified badge for reviewers who previously inquired about the property
 - Helpful-vote and report mechanisms
 
+**🎯 Personalised Recommendations**
+- "Recommended for you" tab ranked by a per-user preference score learned from views, favorites, inquiries and searches
+- Every result shows a match % and why it was recommended; time-decayed so recent taste wins
+
 **📊 Dashboards**
 - **Buyer:** saved favorites, sent inquiries with live reply threads
 - **Agent:** listing management with moderation status, leads inbox
@@ -74,14 +83,16 @@ Every core feature maps to a specific real-world complaint:
 |---|---|
 | Frontend | React 18, Vite, Redux Toolkit, React Router, Tailwind CSS |
 | Maps | Leaflet.js, OpenStreetMap, Nominatim Geocoding API |
-| Backend | Node.js, Express.js, **TypeScript ** |
+| Backend | Node.js, Express.js, **TypeScript (strict)** |
 | APIs | REST (primary) + GraphQL read-layer (Apollo Server 5) |
 | Databases | MongoDB + Mongoose (primary store), **PostgreSQL** (outbox + preference scores) |
 | Auth | JSON Web Tokens (JWT), bcrypt |
 | File Uploads | Multer |
 | Microservices | gRPC (Protocol Buffers) for inter-service calls, Apache Kafka for event streaming (typed contracts, DLQ, outbox) |
 | Containerization | Docker, Docker Compose |
-| Tooling | ESLint, dotenv, Git |
+| Validation & Logging | zod (env + event contracts), pino |
+| Testing & CI | Vitest, GitHub Actions |
+| Tooling | dotenv, tsx, Git |
 
 ---
 
@@ -165,7 +176,7 @@ estatehub/
 
 ## 🚀 Getting Started
 
-### Option A — Docker (recommended)
+### Option A — Docker (recommended, runs everything)
 
 ```bash
 git clone https://github.com/Sunakshi8/EstateHub.git
@@ -188,20 +199,98 @@ docker compose exec postgres psql -U estatehub -c \
   "SELECT feature_type, feature_value, round(score::numeric,2) FROM reco.user_preferences ORDER BY score DESC LIMIT 10;"
 ```
 
-### Option B — Manual
+### Option B — Without Docker
 
-Prerequisites: Node 20+, MongoDB, PostgreSQL 16, Kafka (the compose file can run just the infra: `docker compose up mongo postgres kafka`).
+You only **need Node 20+ and MongoDB**. PostgreSQL and Kafka are optional layers and the app degrades gracefully without them.
+
+| Missing | What happens |
+|---|---|
+| PostgreSQL | API still runs; outbox and recommendations are disabled |
+| Kafka | Events are parked in the PostgreSQL outbox and delivered when Kafka returns (dropped with a warning if PostgreSQL is also down) |
+| recommendation-service | "Recommended for you" falls back to the latest listings |
+| duplicate-detector | API uses its built-in in-process duplicate check |
+
+**1. Install and configure**
 
 ```bash
 npm run install:all
-cp server/.env.example server/.env                       # set JWT_SECRET
-cp services/recommendation-service/.env.example services/recommendation-service/.env
-cp services/notification-consumer/.env.example services/notification-consumer/.env
-npm run seed
-npm run dev
+
+# macOS / Linux
+cp server/.env.example server/.env
+# Windows PowerShell
+copy server\.env.example server\.env
 ```
 
-Everything degrades gracefully: without PostgreSQL the API still serves (no outbox / recommendations); without Kafka events queue in the outbox; without the recommendation service the endpoint falls back to latest listings.
+> The app reads **`server/.env`**, not `.env.example` (that file is only a template and is committed to git — never put real secrets in it).
+
+Edit `server/.env`:
+
+```env
+JWT_SECRET=<long random string>        # node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+MONGO_URI=mongodb://127.0.0.1:27017/estatehub
+# or MongoDB Atlas:
+# MONGO_URI=mongodb+srv://<user>:<password>@<cluster>.mongodb.net/estatehub?retryWrites=true&w=majority
+```
+
+- **Atlas users:** add your IP under *Network Access*, and URL-encode special characters in the password (`@` → `%40`).
+- Keep `INTERNAL_API_TOKEN` identical in `server/.env` and `services/recommendation-service/.env` (the defaults already match).
+
+**2. Seed demo data and run**
+
+```bash
+npm run seed
+npm run dev --prefix server      # terminal 1 → API on :5000
+npm run dev --prefix client      # terminal 2 → UI on :5173
+```
+
+**3. Optional: the full event pipeline, natively**
+
+<details>
+<summary>PostgreSQL 16 + Kafka + microservices</summary>
+
+```bash
+# PostgreSQL
+psql -U postgres -c "CREATE USER estatehub WITH PASSWORD 'estatehub';"
+psql -U postgres -c "CREATE DATABASE estatehub OWNER estatehub;"
+
+# Kafka (KRaft, no Zookeeper) — from the unpacked Kafka folder; needs Java 17+
+KAFKA_CLUSTER_ID=$(bin/kafka-storage.sh random-uuid)
+bin/kafka-storage.sh format -t $KAFKA_CLUSTER_ID -c config/kraft/server.properties
+bin/kafka-server-start.sh config/kraft/server.properties
+```
+
+Tables and Kafka topics are created automatically on first start. Then:
+
+```bash
+cp services/recommendation-service/.env.example services/recommendation-service/.env
+cp services/notification-consumer/.env.example  services/notification-consumer/.env
+cp services/duplicate-detector/.env.example     services/duplicate-detector/.env
+
+npm run dev                                          # server + client + recommendation + notification
+npm run dev --prefix services/duplicate-detector     # optional gRPC service
+```
+
+Kafka brokers requiring SASL/TLS (Confluent Cloud, Upstash, …) are not supported yet — see the roadmap.
+</details>
+
+### Demo accounts (after `npm run seed`)
+
+| Role | Email | Password |
+|---|---|---|
+| Admin | admin@estatehub.com | admin123 |
+| Agent | agent@estatehub.com | agent123 |
+| Buyer | buyer@estatehub.com | buyer123 |
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `Invalid environment configuration: JWT_SECRET: Required` | You haven't created `server/.env` (copy it from `.env.example`) |
+| `MongoDB connection error … 127.0.0.1:27017` | `MONGO_URI` isn't set in `server/.env`, or local MongoDB isn't running. Restart `npm run dev` after editing `.env` |
+| Atlas: `bad auth` / timeout | Wrong password (URL-encode special chars) or your IP isn't in Atlas *Network Access* |
+| Seed pauses 10–20 s, warns about Kafka/PostgreSQL | Expected when they aren't installed; seeding still completes |
+| Windows: `.env` not picked up | Make sure it isn't saved as `.env.txt` |
+| Check what's healthy | Open http://localhost:5000/api/health |
 
 ### Scripts
 
@@ -285,6 +374,8 @@ npm start
 - [ ] Full transactional outbox (write the event atomically with the Mongo change — needs Mongo transactions / change streams)
 - [x] TypeScript on the server and all services
 - [ ] TypeScript on the client
+- [ ] Kafka SASL/TLS support for managed brokers
+- [ ] Per-listing recommendation explanations in the admin dashboard
 - [ ] Collaborative filtering ("buyers like you") on top of preference scores
 - [ ] Kafka authentication/TLS + multi-broker replication for production
 
